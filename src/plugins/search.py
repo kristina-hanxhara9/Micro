@@ -17,10 +17,18 @@ from ..models import BingResult
 log = logging.getLogger(__name__)
 
 
-class BingSearch:
+class _SearchEngine:
+    name: str
+    async def search(self, query: str, count: int = 5) -> list[BingResult]:
+        raise NotImplementedError
+
+
+class BingSearch(_SearchEngine):
+    name = "bing"
+
     def __init__(self, settings: Settings) -> None:
         self._endpoint = settings.bing_search_endpoint
-        self._headers = {"Ocp-Apim-Subscription-Key": settings.bing_search_key}
+        self._headers = {"Ocp-Apim-Subscription-Key": settings.bing_search_key or ""}
         self._timeout = settings.request_timeout_s
         # Bing free tier caps at 3 QPS; one global gate keeps us under it
         # regardless of asyncio concurrency.
@@ -42,6 +50,74 @@ class BingSearch:
             except Exception:
                 continue
         return results
+
+
+class GoogleCseSearch(_SearchEngine):
+    name = "google"
+
+    def __init__(self, settings: Settings) -> None:
+        self._api_key = settings.google_api_key or ""
+        self._cse_id = settings.google_cse_id or ""
+        self._timeout = settings.request_timeout_s
+        self._endpoint = "https://www.googleapis.com/customsearch/v1"
+        self._gate = asyncio.Semaphore(max(1, int(settings.google_qps)))
+
+    async def search(self, query: str, count: int = 5) -> list[BingResult]:
+        async with self._gate:
+            return await asyncio.to_thread(self._search_sync, query, count)
+
+    def _search_sync(self, query: str, count: int) -> list[BingResult]:
+        params = {"key": self._api_key, "cx": self._cse_id, "q": query, "num": min(count, 10)}
+        r = requests.get(self._endpoint, params=params, timeout=self._timeout)
+        r.raise_for_status()
+        items = r.json().get("items", []) or []
+        results: list[BingResult] = []
+        for item in items[:count]:
+            try:
+                results.append(
+                    BingResult(
+                        title=item.get("title", ""),
+                        url=item["link"],
+                        snippet=item.get("snippet", ""),
+                    )
+                )
+            except Exception:
+                continue
+        return results
+
+
+class SearchDispatcher:
+    """Tries primary engine, falls back to the secondary if results are empty
+    or the official-site picker can't find a plausible match."""
+
+    def __init__(self, primary: _SearchEngine | None, secondary: _SearchEngine | None) -> None:
+        self.primary = primary
+        self.secondary = secondary
+
+    async def search(self, query: str, count: int = 5) -> tuple[list[BingResult], str]:
+        for engine in (self.primary, self.secondary):
+            if engine is None:
+                continue
+            try:
+                results = await engine.search(query, count)
+            except Exception as e:
+                log.warning("%s search failed for %r: %s", engine.name, query, e)
+                continue
+            if results:
+                return results, engine.name
+        return [], "none"
+
+
+def build_dispatcher(settings: Settings) -> SearchDispatcher:
+    bing = BingSearch(settings) if settings.bing_search_key else None
+    google = (
+        GoogleCseSearch(settings)
+        if settings.google_api_key and settings.google_cse_id
+        else None
+    )
+    if settings.search_primary == "google" and google is not None:
+        return SearchDispatcher(primary=google, secondary=bing)
+    return SearchDispatcher(primary=bing or google, secondary=google if (bing and google) else None)
 
 
 def _heuristic_pick(retailer: str, results: list[BingResult]) -> int | None:

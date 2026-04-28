@@ -1,4 +1,4 @@
-from src.plugins.scraper import _extract_visible_text
+from src.plugins.scraper import _extract_json_ld, _extract_visible_text
 
 
 def test_extract_strips_scripts_and_chrome():
@@ -27,3 +27,41 @@ def test_extract_strips_scripts_and_chrome():
 def test_extract_collapses_whitespace():
     html = "<html><body>  hello   \n\n   world  </body></html>"
     assert _extract_visible_text(html) == "hello world"
+
+
+def test_json_ld_single_product():
+    html = """
+    <html><head>
+      <script type="application/ld+json">
+      {"@context":"https://schema.org","@type":"Product","name":"iPhone 15",
+       "brand":{"@type":"Brand","name":"Apple"},
+       "offers":{"@type":"Offer","price":"799.00","priceCurrency":"USD"}}
+      </script>
+    </head><body></body></html>
+    """
+    blobs = _extract_json_ld(html)
+    assert len(blobs) == 1
+    assert blobs[0]["@type"] == "Product"
+    assert blobs[0]["name"] == "iPhone 15"
+
+
+def test_json_ld_graph_unwraps():
+    html = """
+    <html><head>
+      <script type="application/ld+json">
+      {"@graph":[
+        {"@type":"Organization","name":"Best Buy"},
+        {"@type":"Product","name":"Sony TV","offers":{"price":"499","priceCurrency":"USD"}}
+      ]}
+      </script>
+    </head><body></body></html>
+    """
+    blobs = _extract_json_ld(html)
+    types = [b.get("@type") for b in blobs]
+    assert "Organization" in types
+    assert "Product" in types
+
+
+def test_json_ld_skips_invalid():
+    html = '<script type="application/ld+json">{ this is not json }</script>'
+    assert _extract_json_ld(html) == []

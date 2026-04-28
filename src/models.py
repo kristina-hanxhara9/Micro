@@ -5,7 +5,7 @@ from pydantic import BaseModel, EmailStr, Field, HttpUrl
 
 class PriceSample(BaseModel):
     item: str
-    price: float
+    price: float | None = None
     currency: str = "USD"
 
 
@@ -21,7 +21,11 @@ class ExtractedRetailer(BaseModel):
     about: str | None = Field(default=None, description="Short description, ≤500 chars.")
     categories: list[str] = Field(default_factory=list, description="What they sell, e.g. ['electronics', 'home goods'].")
     brands: list[str] = Field(default_factory=list, description="Named brands carried.")
-    sample_prices: list[PriceSample] = Field(default_factory=list, description="Up to 5 representative prices.")
+    sample_prices: list[PriceSample] = Field(
+        default_factory=list,
+        description="Up to 20 specific products with prices when prices are visible. "
+        "If a product is mentioned without a price, leave price null.",
+    )
     phone: str | None = None
     email: str | None = None
     address: str | None = None
