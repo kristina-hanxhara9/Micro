@@ -5,12 +5,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src import tools as tools_mod
 from src.models import OrchestratorOutput, PriceSample
 from src.pipeline import (
     PipelineDeps,
     _coerce_output,
     _heuristic_domain,
     _is_aggregator,
+    _is_grounded_website,
+    _same_host,
     process_retailer,
 )
 
@@ -61,10 +64,52 @@ def test_coerce_output_returns_none_on_garbage():
     assert _coerce_output(result) is None
 
 
-def _mock_deps(agent_run_result) -> PipelineDeps:
+def _mock_deps(agent_run_result, simulated_scrape_urls: list[str] | None = None) -> PipelineDeps:
+    """The mocked agent.run optionally simulates the scrape tool by appending
+    URLs into the per-task ContextVar. This mirrors what the real scrape tool
+    does and lets us exercise the hallucination guard."""
+
+    async def _run(*_args, **_kwargs):
+        if simulated_scrape_urls:
+            bound = tools_mod._scraped_urls_ctx.get()
+            if bound is not None:
+                bound.extend(simulated_scrape_urls)
+        return agent_run_result
+
     agent = MagicMock()
-    agent.run = AsyncMock(return_value=agent_run_result)
+    agent.run = AsyncMock(side_effect=_run)
     return PipelineDeps(settings=MagicMock(), agent=agent, client=MagicMock())
+
+
+def test_same_host_helper():
+    assert _same_host("https://www.sephora.com/", "https://sephora.com/about")
+    assert _same_host("http://www.target.com/x", "https://target.com/y")
+    assert not _same_host("https://www.sephora.com/", "https://sephoria.com/")
+    assert not _same_host("https://www.target.com/", "https://www.walmart.com/")
+
+
+def test_grounded_website_accepts_hint_match():
+    assert _is_grounded_website(
+        "https://www.sephora.com/",
+        scraped_urls=[],
+        hint="https://www.sephora.com",
+    )
+
+
+def test_grounded_website_accepts_scrape_match():
+    assert _is_grounded_website(
+        "https://www.bhphotovideo.com/",
+        scraped_urls=["https://www.bhphotovideo.com"],
+        hint=None,
+    )
+
+
+def test_grounded_website_rejects_unknown_host():
+    assert not _is_grounded_website(
+        "https://made-up-domain.com/",
+        scraped_urls=["https://www.bhphotovideo.com"],
+        hint="https://www.bhphoto.com",
+    )
 
 
 @pytest.mark.asyncio
@@ -99,13 +144,36 @@ async def test_process_retailer_happy_path():
 @pytest.mark.asyncio
 async def test_process_retailer_passes_no_hint_for_ambiguous_names():
     out = OrchestratorOutput(website="https://www.bhphotovideo.com")
-    deps = _mock_deps(MagicMock(value=out))
+    deps = _mock_deps(
+        MagicMock(value=out),
+        simulated_scrape_urls=["https://www.bhphotovideo.com"],
+    )
 
-    await process_retailer("B&H Photo", deps)
+    rec = await process_retailer("B&H Photo", deps)
 
     user_msg = deps.agent.run.await_args.args[0]
     assert "Likely website" not in user_msg
     assert "Retailer: B&H Photo" in user_msg
+    assert rec.website == "https://www.bhphotovideo.com"
+
+
+@pytest.mark.asyncio
+async def test_hallucinated_website_is_dropped():
+    """Agent returns a website it never scraped and that doesn't match the
+    heuristic hint -> guard kicks in and drops it."""
+    out = OrchestratorOutput(
+        website="https://made-up-store.com",
+        about="Some store",
+    )
+    deps = _mock_deps(
+        MagicMock(value=out),
+        simulated_scrape_urls=[],  # agent didn't actually scrape anything
+    )
+
+    rec = await process_retailer("B&H Photo", deps)
+
+    assert rec.website is None
+    assert "no_website_found" in rec.flags
 
 
 @pytest.mark.asyncio

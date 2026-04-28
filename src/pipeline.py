@@ -58,6 +58,24 @@ def _is_aggregator(url: str) -> bool:
     return any(bad in host for bad in AGGREGATOR_HOSTS)
 
 
+def _same_host(a: str, b: str) -> bool:
+    """True if two URLs share the same registered host (ignoring www. prefix)."""
+    ha = (urlparse(a).hostname or "").lower().removeprefix("www.")
+    hb = (urlparse(b).hostname or "").lower().removeprefix("www.")
+    return bool(ha) and ha == hb
+
+
+def _is_grounded_website(
+    website: str, scraped_urls: list[str], hint: str | None
+) -> bool:
+    """A website is 'grounded' if it shares a host with either the heuristic
+    hint OR a URL the agent actually scraped. Catches the case where the LLM
+    invents a URL that wasn't in any tool output."""
+    if hint and _same_host(website, hint):
+        return True
+    return any(_same_host(website, u) for u in scraped_urls)
+
+
 def _coerce_output(result: object) -> OrchestratorOutput | None:
     """ChatAgent.run with response_format returns an AgentRunResponse whose
     parsed payload may live on `.value`, `.parsed`, or be reconstructable from
@@ -81,6 +99,7 @@ async def process_retailer(name: str, deps: PipelineDeps) -> RetailerRecord:
     if hint:
         user_msg += f"\nLikely website: {hint} (verify before trusting)"
 
+    scraped_urls, ctx_token = tools_mod.bind_scraped_urls()
     try:
         result = await deps.agent.run(
             user_msg,
@@ -90,7 +109,7 @@ async def process_retailer(name: str, deps: PipelineDeps) -> RetailerRecord:
         log.exception("Orchestrator failed for %s: %s", name, e)
         return score_record(name, None, ExtractedRetailer(), [])
     finally:
-        tools_mod.reset_scrape_cache()
+        tools_mod.unbind_scraped_urls(ctx_token)
 
     output = _coerce_output(result)
     if output is None:
@@ -100,6 +119,12 @@ async def process_retailer(name: str, deps: PipelineDeps) -> RetailerRecord:
     website = output.website
     if website and _is_aggregator(website):
         log.warning("Orchestrator returned aggregator URL for %s: %s", name, website)
+        website = None
+    if website and not _is_grounded_website(website, scraped_urls, hint):
+        log.warning(
+            "Ungrounded website for %s: %s (scraped=%s, hint=%s)",
+            name, website, scraped_urls, hint,
+        )
         website = None
 
     extracted = ExtractedRetailer(

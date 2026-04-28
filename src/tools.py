@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextvars import ContextVar
 from typing import Annotated, Any
 
 from agent_framework import tool
@@ -30,6 +31,32 @@ _scraper: Scraper | None = None
 _openai_client: AsyncAzureOpenAI | None = None
 _scrape_cache: dict[str, list[ScrapedPage]] = {}
 _init_lock = asyncio.Lock()
+
+# Per-retailer set of URLs the agent actually called scrape on. The pipeline
+# binds this ContextVar before agent.run() and inspects it after, to verify
+# the website the agent returns was one it actually visited (hallucination
+# guard). asyncio tasks each get their own binding, so concurrency is safe.
+_scraped_urls_ctx: ContextVar[list[str] | None] = ContextVar(
+    "_scraped_urls_ctx", default=None
+)
+
+
+def get_scraped_urls() -> list[str]:
+    """URLs scrape_retailer_site was called with during the current task.
+    Returns [] if no per-retailer context was bound."""
+    urls = _scraped_urls_ctx.get()
+    return list(urls) if urls is not None else []
+
+
+def bind_scraped_urls() -> tuple[list[str], object]:
+    """Bind a fresh per-task scrape-URL list. Returns (list, reset_token)."""
+    fresh: list[str] = []
+    token = _scraped_urls_ctx.set(fresh)
+    return fresh, token
+
+
+def unbind_scraped_urls(token: object) -> None:
+    _scraped_urls_ctx.reset(token)  # type: ignore[arg-type]
 
 
 async def _ensure_init() -> Settings:
@@ -62,11 +89,6 @@ async def aclose() -> None:
     _scrape_cache.clear()
 
 
-def reset_scrape_cache() -> None:
-    """Drop cached scrape results between retailers to bound memory growth."""
-    _scrape_cache.clear()
-
-
 @tool(
     description=(
         "Fetch the retailer's website. Pass the official site URL you found via "
@@ -88,6 +110,9 @@ async def scrape_retailer_site(
     if not pages:
         return f"Scraped {url} but found no usable pages."
     _scrape_cache[url] = pages
+    bound = _scraped_urls_ctx.get()
+    if bound is not None:
+        bound.append(url)
     total_text = sum(len(p.text) for p in pages)
     total_jsonld = sum(len(p.json_ld) for p in pages)
     return (
