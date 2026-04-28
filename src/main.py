@@ -23,13 +23,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(argv if argv is not None else sys.argv[1:])
-    logging.basicConfig(
-        level=args.log_level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
+async def _async_main(args: argparse.Namespace) -> int:
     settings = load_settings()
     threshold = args.threshold if args.threshold is not None else settings.confidence_threshold
 
@@ -40,10 +34,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Processing {len(names)} retailers (concurrency={args.concurrency})...")
 
     Path(".cache").mkdir(exist_ok=True)
-    deps = build_deps(settings)
 
     t0 = time.monotonic()
-    records = asyncio.run(run_pipeline(names, deps, concurrency=args.concurrency))
+    async with build_deps(settings) as deps:
+        records = await run_pipeline(names, deps, concurrency=args.concurrency)
     elapsed = time.monotonic() - t0
 
     n_ok, n_review = write_results(args.output, records, threshold)
@@ -53,6 +47,15 @@ def main(argv: list[str] | None = None) -> int:
         f"in {elapsed:.1f}s (avg confidence {avg_conf:.2f})."
     )
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv if argv is not None else sys.argv[1:])
+    logging.basicConfig(
+        level=args.log_level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    return asyncio.run(_async_main(args))
 
 
 if __name__ == "__main__":

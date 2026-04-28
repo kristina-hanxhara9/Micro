@@ -1,184 +1,173 @@
+"""Find a retailer's official website via Azure AI Foundry's Grounding with
+Bing Search tool. Replaces the retired standalone Bing Search v7 API."""
+
 from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 from urllib.parse import urlparse
 
-import requests
+from azure.ai.projects import AIProjectClient
+from azure.ai.projects.models import (
+    BingGroundingSearchConfiguration,
+    BingGroundingSearchToolParameters,
+    BingGroundingTool,
+    PromptAgentDefinition,
+)
 from rapidfuzz import fuzz
-from semantic_kernel import Kernel
-from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion
-from semantic_kernel.contents import ChatHistory
 
 from ..config import Settings
-from ..kernel_setup import CHAT_SERVICE_ID
-from ..models import BingResult
+from ..models import OfficialSiteAnswer
 
 log = logging.getLogger(__name__)
 
+AGENT_NAME = "retailer-finder"
+AGENT_INSTRUCTIONS = (
+    "You receive a retailer name from the user. Use the Bing grounding tool to "
+    "find the retailer's OWN official corporate website. Skip directories (Yelp, "
+    "BBB, Yellow Pages), marketplaces (Amazon, eBay), social media, Wikipedia, "
+    "and resellers. Return the full URL in `website`, or null if nothing on the "
+    "first page of results is clearly the retailer's own site. Keep `reasoning` "
+    "to one sentence."
+)
 
-class _SearchEngine:
-    name: str
-    async def search(self, query: str, count: int = 5) -> list[BingResult]:
-        raise NotImplementedError
-
-
-class BingSearch(_SearchEngine):
-    name = "bing"
-
-    def __init__(self, settings: Settings) -> None:
-        self._endpoint = settings.bing_search_endpoint
-        self._headers = {"Ocp-Apim-Subscription-Key": settings.bing_search_key or ""}
-        self._timeout = settings.request_timeout_s
-        # Bing free tier caps at 3 QPS; one global gate keeps us under it
-        # regardless of asyncio concurrency.
-        self._gate = asyncio.Semaphore(max(1, int(settings.bing_qps)))
-
-    async def search(self, query: str, count: int = 5) -> list[BingResult]:
-        async with self._gate:
-            return await asyncio.to_thread(self._search_sync, query, count)
-
-    def _search_sync(self, query: str, count: int) -> list[BingResult]:
-        params = {"q": query, "count": count, "responseFilter": "Webpages", "mkt": "en-US"}
-        r = requests.get(self._endpoint, headers=self._headers, params=params, timeout=self._timeout)
-        r.raise_for_status()
-        webpages = r.json().get("webPages", {}).get("value", [])
-        results: list[BingResult] = []
-        for w in webpages[:count]:
-            try:
-                results.append(BingResult(title=w["name"], url=w["url"], snippet=w.get("snippet", "")))
-            except Exception:
-                continue
-        return results
+AGGREGATOR_HOSTS = (
+    "yelp.", "yellowpages.", "wikipedia.", "facebook.", "linkedin.",
+    "instagram.", "twitter.", "x.com", "amazon.", "ebay.", "bbb.",
+    "tripadvisor.", "pinterest.",
+)
 
 
-class GoogleCseSearch(_SearchEngine):
-    name = "google"
-
-    def __init__(self, settings: Settings) -> None:
-        self._api_key = settings.google_api_key or ""
-        self._cse_id = settings.google_cse_id or ""
-        self._timeout = settings.request_timeout_s
-        self._endpoint = "https://www.googleapis.com/customsearch/v1"
-        self._gate = asyncio.Semaphore(max(1, int(settings.google_qps)))
-
-    async def search(self, query: str, count: int = 5) -> list[BingResult]:
-        async with self._gate:
-            return await asyncio.to_thread(self._search_sync, query, count)
-
-    def _search_sync(self, query: str, count: int) -> list[BingResult]:
-        params = {"key": self._api_key, "cx": self._cse_id, "q": query, "num": min(count, 10)}
-        r = requests.get(self._endpoint, params=params, timeout=self._timeout)
-        r.raise_for_status()
-        items = r.json().get("items", []) or []
-        results: list[BingResult] = []
-        for item in items[:count]:
-            try:
-                results.append(
-                    BingResult(
-                        title=item.get("title", ""),
-                        url=item["link"],
-                        snippet=item.get("snippet", ""),
-                    )
-                )
-            except Exception:
-                continue
-        return results
+def _domain_root(url: str) -> str:
+    host = urlparse(url).hostname or ""
+    return host.replace("www.", "").split(".")[0]
 
 
-class SearchDispatcher:
-    """Tries primary engine, falls back to the secondary if results are empty
-    or the official-site picker can't find a plausible match."""
-
-    def __init__(self, primary: _SearchEngine | None, secondary: _SearchEngine | None) -> None:
-        self.primary = primary
-        self.secondary = secondary
-
-    async def search(self, query: str, count: int = 5) -> tuple[list[BingResult], str]:
-        for engine in (self.primary, self.secondary):
-            if engine is None:
-                continue
-            try:
-                results = await engine.search(query, count)
-            except Exception as e:
-                log.warning("%s search failed for %r: %s", engine.name, query, e)
-                continue
-            if results:
-                return results, engine.name
-        return [], "none"
-
-
-def build_dispatcher(settings: Settings) -> SearchDispatcher:
-    bing = BingSearch(settings) if settings.bing_search_key else None
-    google = (
-        GoogleCseSearch(settings)
-        if settings.google_api_key and settings.google_cse_id
-        else None
-    )
-    if settings.search_primary == "google" and google is not None:
-        return SearchDispatcher(primary=google, secondary=bing)
-    return SearchDispatcher(primary=bing or google, secondary=google if (bing and google) else None)
-
-
-def _heuristic_pick(retailer: str, results: list[BingResult]) -> int | None:
-    """Fuzzy-match retailer name against the result domain root.
-    Used as a fallback (and a sanity cross-check) for the LLM picker."""
-    if not results:
-        return None
-    best_idx, best_score = 0, -1
-    for i, r in enumerate(results):
-        host = urlparse(str(r.url)).hostname or ""
-        root = host.replace("www.", "").split(".")[0]
-        score = fuzz.token_set_ratio(retailer.lower(), root.lower())
-        # Penalize known directory/aggregator domains.
-        if any(bad in host for bad in ("yelp.", "yellowpages.", "wikipedia.", "facebook.", "linkedin.", "amazon.", "bbb.")):
-            score -= 40
-        if score > best_score:
-            best_idx, best_score = i, score
-    return best_idx if best_score > 30 else None
-
-
-async def pick_official_site(
-    kernel: Kernel,
-    retailer: str,
-    results: list[BingResult],
-) -> str | None:
-    if not results:
-        return None
-
-    # Cheap heuristic first; saves the LLM call ~80% of the time.
-    h_idx = _heuristic_pick(retailer, results)
-    if h_idx is not None:
-        host = urlparse(str(results[h_idx].url)).hostname or ""
-        root = host.replace("www.", "").split(".")[0]
-        if fuzz.token_set_ratio(retailer.lower(), root.lower()) >= 80:
-            return str(results[h_idx].url)
-
-    listing = "\n".join(
-        f"{i}. {r.title} — {r.url}\n   {r.snippet}" for i, r in enumerate(results)
-    )
-    prompt = (
-        f"Retailer: {retailer}\n\n"
-        f"Search results:\n{listing}\n\n"
-        "Return ONLY the integer index (0-based) of the result that is the retailer's "
-        "OWN official website. Skip directories (Yelp, BBB, Yellow Pages), Wikipedia, "
-        "social media, and resellers. If none look official, return -1."
-    )
-
-    try:
-        chat: AzureChatCompletion = kernel.get_service(CHAT_SERVICE_ID)  # type: ignore[assignment]
-        history = ChatHistory()
-        history.add_user_message(prompt)
-        settings = chat.instantiate_prompt_execution_settings(
-            service_id=CHAT_SERVICE_ID, temperature=0, max_tokens=4,
-        )
-        response = await chat.get_chat_message_content(chat_history=history, settings=settings)
-        raw = (response.content or "").strip()
-        idx = int(raw.split()[0])
-    except Exception as e:
-        log.warning("LLM domain pick failed for %s: %s", retailer, e)
-        return str(results[h_idx].url) if h_idx is not None else None
-
-    if 0 <= idx < len(results):
-        return str(results[idx].url)
+def _heuristic_domain(retailer: str) -> str | None:
+    """If the retailer name is a single alphanumeric word, guess <name>.com.
+    Only fires for unambiguous cases — names with spaces or punctuation fall
+    through to the grounding agent because the .com guess is too risky."""
+    name = retailer.strip().lower()
+    if 3 <= len(name) <= 25 and name.isalnum():
+        return f"https://www.{name}.com"
     return None
+
+
+class FoundryGroundingSearch:
+    """Wraps a single shared Foundry agent + the Responses-API client used to
+    invoke it. Create one per pipeline run; reuse across all retailers."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._project_client: AIProjectClient | None = None
+        self._openai_client: Any = None
+        self._agent_name: str | None = None
+        self._agent_version: str | None = None
+        self._lock = asyncio.Lock()
+
+    async def __aenter__(self) -> "FoundryGroundingSearch":
+        await asyncio.to_thread(self._setup_sync)
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await asyncio.to_thread(self._teardown_sync)
+
+    def _setup_sync(self) -> None:
+        from azure.identity import DefaultAzureCredential
+
+        self._project_client = AIProjectClient(
+            endpoint=self._settings.foundry_project_endpoint,
+            credential=DefaultAzureCredential(),
+        )
+        self._openai_client = self._project_client.get_openai_client()
+
+        tool = BingGroundingTool(
+            bing_grounding=BingGroundingSearchToolParameters(
+                search_configurations=[
+                    BingGroundingSearchConfiguration(
+                        project_connection_id=self._settings.bing_connection_id,
+                    )
+                ]
+            )
+        )
+        agent = self._project_client.agents.create_version(
+            agent_name=AGENT_NAME,
+            definition=PromptAgentDefinition(
+                model=self._settings.agent_deployment,
+                instructions=AGENT_INSTRUCTIONS,
+                tools=[tool],
+            ),
+            description="Finds the official website of a retailer using Bing grounding.",
+        )
+        self._agent_name = agent.name
+        self._agent_version = agent.version
+        log.info("Foundry agent ready: %s (version %s)", agent.name, agent.version)
+
+    def _teardown_sync(self) -> None:
+        if self._project_client and self._agent_name and self._agent_version:
+            try:
+                self._project_client.agents.delete_version(
+                    agent_name=self._agent_name,
+                    agent_version=self._agent_version,
+                )
+                log.info("Foundry agent deleted: %s", self._agent_name)
+            except Exception as e:
+                log.warning("Failed to delete agent %s: %s", self._agent_name, e)
+        if self._project_client:
+            try:
+                self._project_client.close()
+            except Exception:
+                pass
+
+    async def find_official_site(self, retailer: str) -> str | None:
+        # Heuristic short-circuit: if the name maps obviously to <name>.com,
+        # skip the grounding call entirely. Worth ~$0.014 saved per hit.
+        guess = _heuristic_domain(retailer)
+        if guess and _is_plausible_official(retailer, guess):
+            log.debug("heuristic short-circuit for %s -> %s", retailer, guess)
+            return guess
+
+        try:
+            answer = await asyncio.to_thread(self._call_agent_sync, retailer)
+        except Exception as e:
+            log.error("Grounding agent call failed for %s: %s", retailer, e)
+            return None
+
+        if not answer or not answer.website:
+            return None
+        if _is_aggregator(answer.website):
+            log.warning("Agent returned aggregator URL for %s: %s", retailer, answer.website)
+            return None
+        return answer.website
+
+    def _call_agent_sync(self, retailer: str) -> OfficialSiteAnswer | None:
+        if self._openai_client is None or self._agent_name is None:
+            raise RuntimeError("FoundryGroundingSearch not initialized — use async with")
+
+        response = self._openai_client.responses.parse(
+            input=f"Retailer: {retailer}",
+            tool_choice="required",
+            text_format=OfficialSiteAnswer,
+            extra_body={
+                "agent_reference": {
+                    "name": self._agent_name,
+                    "type": "agent_reference",
+                }
+            },
+        )
+        return getattr(response, "output_parsed", None)
+
+
+def _is_aggregator(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(bad in host for bad in AGGREGATOR_HOSTS)
+
+
+def _is_plausible_official(retailer: str, url: str) -> bool:
+    if _is_aggregator(url):
+        return False
+    root = _domain_root(url)
+    if not root:
+        return False
+    return fuzz.token_set_ratio(retailer.lower(), root) >= 70

@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import AsyncIterator
 
 from openai import AsyncAzureOpenAI
-from semantic_kernel import Kernel
 
 from .config import Settings
-from .kernel_setup import build_kernel
 from .models import ExtractedRetailer, RetailerRecord
 from .plugins.extractor import extract_retailer
 from .plugins.scraper import Scraper
-from .plugins.search import SearchDispatcher, build_dispatcher, pick_official_site
+from .plugins.search import FoundryGroundingSearch
 from .plugins.validator import score_record
 
 log = logging.getLogger(__name__)
@@ -21,48 +21,46 @@ log = logging.getLogger(__name__)
 @dataclass
 class PipelineDeps:
     settings: Settings
-    kernel: Kernel
-    search: SearchDispatcher
+    search: FoundryGroundingSearch
     scraper: Scraper
     openai_client: AsyncAzureOpenAI
 
 
-def build_deps(settings: Settings) -> PipelineDeps:
-    return PipelineDeps(
-        settings=settings,
-        kernel=build_kernel(settings),
-        search=build_dispatcher(settings),
-        scraper=Scraper(settings),
-        # Direct OpenAI client used only for the structured-output extraction call,
-        # which relies on `client.beta.chat.completions.parse(response_format=...)`.
-        openai_client=AsyncAzureOpenAI(
+@asynccontextmanager
+async def build_deps(settings: Settings) -> AsyncIterator[PipelineDeps]:
+    """Sets up the Foundry agent + clients, yields deps, tears down on exit."""
+    if settings.azure_openai_api_key:
+        openai_client = AsyncAzureOpenAI(
             api_key=settings.azure_openai_api_key,
             api_version=settings.azure_openai_api_version,
             azure_endpoint=settings.azure_openai_endpoint,
-        ),
-    )
+        )
+    else:
+        # AAD auth path: token comes from DefaultAzureCredential.
+        from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
+        )
+        openai_client = AsyncAzureOpenAI(
+            azure_ad_token_provider=token_provider,
+            api_version=settings.azure_openai_api_version,
+            azure_endpoint=settings.azure_openai_endpoint,
+        )
+
+    async with FoundryGroundingSearch(settings) as search:
+        try:
+            yield PipelineDeps(
+                settings=settings,
+                search=search,
+                scraper=Scraper(settings),
+                openai_client=openai_client,
+            )
+        finally:
+            await openai_client.close()
 
 
 async def process_retailer(name: str, deps: PipelineDeps) -> RetailerRecord:
-    deployment = deps.settings.azure_openai_deployment
-
-    results, engine = await deps.search.search(f"{name} official website")
-    if not results:
-        log.warning("No search results from any backend for %s", name)
-        return score_record(name, None, ExtractedRetailer(), [])
-
-    website = await pick_official_site(deps.kernel, name, results)
-
-    # If primary couldn't pick a winner and we used primary, retry with the other engine.
-    if not website and deps.search.secondary is not None and engine == deps.search.primary.name:  # type: ignore[union-attr]
-        try:
-            fallback_results = await deps.search.secondary.search(f"{name} official website")
-        except Exception as e:
-            log.warning("Secondary search failed for %s: %s", name, e)
-            fallback_results = []
-        if fallback_results:
-            website = await pick_official_site(deps.kernel, name, fallback_results)
-
+    website = await deps.search.find_official_site(name)
     if not website:
         return score_record(name, None, ExtractedRetailer(), [])
 
@@ -75,7 +73,11 @@ async def process_retailer(name: str, deps: PipelineDeps) -> RetailerRecord:
     page_tuples = [(p.url, p.text) for p in pages]
     json_ld_blobs = [b for p in pages for b in p.json_ld]
     extracted = await extract_retailer(
-        deps.openai_client, deployment, name, page_tuples, json_ld_blobs,
+        deps.openai_client,
+        deps.settings.extraction_deployment,
+        name,
+        page_tuples,
+        json_ld_blobs,
     )
     sources = [p.url for p in pages]
     return score_record(name, website, extracted, sources)

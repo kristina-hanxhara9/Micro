@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, EmailStr, Field, HttpUrl
+from pydantic import BaseModel, EmailStr, Field
 
 
 class PriceSample(BaseModel):
@@ -9,10 +9,19 @@ class PriceSample(BaseModel):
     currency: str = "USD"
 
 
-class BingResult(BaseModel):
-    title: str
-    url: HttpUrl
-    snippet: str
+class OfficialSiteAnswer(BaseModel):
+    """Structured response from the Foundry grounding agent."""
+
+    website: str | None = Field(
+        default=None,
+        description="Full URL of the retailer's official corporate website, or null if "
+        "no result is clearly the retailer's own site (skip directories, marketplaces, "
+        "social media, Wikipedia).",
+    )
+    reasoning: str = Field(
+        default="",
+        description="One-sentence justification for the chosen URL (or for null).",
+    )
 
 
 class ExtractedRetailer(BaseModel):
