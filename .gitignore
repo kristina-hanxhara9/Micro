@@ -1,0 +1,14 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.cache/
+*.sqlite
+*.sqlite3
+.DS_Store
+
+# Outputs — keep fixtures, ignore everything else
+*.xlsx
+!tests/fixtures/sample_retailers.xlsx
