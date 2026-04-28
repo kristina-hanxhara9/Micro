@@ -9,21 +9,6 @@ class PriceSample(BaseModel):
     currency: str = "USD"
 
 
-class OfficialSiteAnswer(BaseModel):
-    """Structured response from the Foundry grounding agent."""
-
-    website: str | None = Field(
-        default=None,
-        description="Full URL of the retailer's official corporate website, or null if "
-        "no result is clearly the retailer's own site (skip directories, marketplaces, "
-        "social media, Wikipedia).",
-    )
-    reasoning: str = Field(
-        default="",
-        description="One-sentence justification for the chosen URL (or for null).",
-    )
-
-
 class ExtractedRetailer(BaseModel):
     """LLM-facing schema. No confidence/flags here — those are computed locally."""
 
@@ -38,6 +23,28 @@ class ExtractedRetailer(BaseModel):
     phone: str | None = None
     email: str | None = None
     address: str | None = None
+
+
+class OrchestratorOutput(BaseModel):
+    """What the orchestrator agent returns after running the search/scrape/extract
+    tool sequence. Local validator turns this into a RetailerRecord."""
+
+    website: str | None = Field(
+        default=None,
+        description="Retailer's own official website URL, or null if no clearly "
+        "official site was found. Skip aggregators (Yelp, Wikipedia, Amazon, social).",
+    )
+    about: str | None = Field(default=None, description="Short description, ≤500 chars.")
+    categories: list[str] = Field(default_factory=list)
+    brands: list[str] = Field(default_factory=list)
+    sample_prices: list[PriceSample] = Field(default_factory=list)
+    phone: str | None = None
+    email: str | None = None
+    address: str | None = None
+    sources: list[str] = Field(
+        default_factory=list,
+        description="URLs that were scraped to produce this output.",
+    )
 
 
 class RetailerRecord(BaseModel):

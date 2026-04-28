@@ -10,14 +10,11 @@ load_dotenv()
 
 @dataclass(frozen=True)
 class Settings:
+    foundry_project_endpoint: str
     azure_openai_endpoint: str
     azure_openai_api_version: str
-    azure_openai_api_key: str | None
     agent_deployment: str
     extraction_deployment: str
-
-    foundry_project_endpoint: str
-    bing_connection_id: str
 
     request_timeout_s: float = 15.0
     page_char_cap: int = 12_000
@@ -29,22 +26,19 @@ class Settings:
 
 def load_settings() -> Settings:
     required = (
+        "FOUNDRY_PROJECT_ENDPOINT",
         "AZURE_OPENAI_ENDPOINT",
         "AZURE_OPENAI_DEPLOYMENT_AGENT",
         "AZURE_OPENAI_DEPLOYMENT_EXTRACTION",
-        "FOUNDRY_PROJECT_ENDPOINT",
-        "BING_PROJECT_CONNECTION_ID",
     )
     missing = [v for v in required if not os.getenv(v)]
     if missing:
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
     return Settings(
+        foundry_project_endpoint=os.environ["FOUNDRY_PROJECT_ENDPOINT"],
         azure_openai_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
         azure_openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2025-03-01-preview"),
-        azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY") or None,
         agent_deployment=os.environ["AZURE_OPENAI_DEPLOYMENT_AGENT"],
         extraction_deployment=os.environ["AZURE_OPENAI_DEPLOYMENT_EXTRACTION"],
-        foundry_project_endpoint=os.environ["FOUNDRY_PROJECT_ENDPOINT"],
-        bing_connection_id=os.environ["BING_PROJECT_CONNECTION_ID"],
     )

@@ -2,48 +2,73 @@
 
 Microsoft-native pipeline that reads an Excel file of retailer names and enriches each row with website, "about" blurb, product categories, brands carried, sample prices, phone, email, and address. Low-confidence rows are routed to a separate `needs_review` sheet.
 
-Stack: **Azure AI Foundry Agent Service (Grounding with Bing Search) + Azure OpenAI (gpt-4o + gpt-4o-mini) + OpenPyXL**.
+Stack: **Microsoft Agent Framework 1.2** + **Azure AI Foundry** (FoundryChatClient + hosted Web Search) + **Azure OpenAI** (gpt-4o orchestrator + gpt-4o-mini extraction) + **OpenPyXL**.
 
 ## Architecture
 
-Per retailer the pipeline runs a fixed sequence (no auto-planner) for predictability and cost control:
+A real **orchestrator agent** decides per retailer which of three tools to call:
 
-1. **Heuristic shortcut** — if the name maps cleanly to `<name>.com` (e.g. "Sephora" → sephora.com), return that URL with no API call. Saves ~50% of grounding calls.
-2. **Foundry agent + Grounding with Bing** — for ambiguous names, one shared agent (created at startup, deleted at shutdown) is queried via the **Responses API** with `responses.parse(text_format=OfficialSiteAnswer)`. The agent uses `BingGroundingTool` to search the web and returns a typed `{ website, reasoning }`. Aggregator domains (Yelp, Wikipedia, Amazon, etc.) are rejected post-hoc.
-3. **Scrape** — `requests` + BS4 fetches `/`, `/about`, `/contact`, `/products`, `/shop`, `/store`, `/collections`, `/catalog`, `/menu`. Then crawls up to 5 individual product pages discovered via internal links. Pages cached in SQLite by URL for 7 days.
-4. **JSON-LD harvest** — schema.org structured data (`Product`, `Offer`, `Organization`, `LocalBusiness`) is parsed directly out of `<script type="application/ld+json">` tags. Gold standard for product names + prices.
-5. **Extract** — single Azure OpenAI call to **gpt-4o-mini** with Pydantic structured output (`client.beta.chat.completions.parse`) using both trimmed page text and JSON-LD blobs → `ExtractedRetailer` (about, categories, brands, up to 20 products w/ prices, phone, email, address).
-6. **Validate** — rule-based confidence scoring + flagging (no LLM): website found, domain matches name, phone parses, brands/categories present, etc.
+```
+INPUT: retailer name
+       │
+       ▼
+┌─────────────────────────────────────────────────────────┐
+│ ORCHESTRATOR  Agent(FoundryChatClient, model=gpt-4o)    │
+│                                                         │
+│ tools = [                                               │
+│   client.get_web_search_tool()  # Foundry hosted        │
+│   scrape_retailer_site,         # @tool function        │
+│   extract_retailer_fields,      # @tool function        │
+│ ]                                                       │
+│                                                         │
+│ instructions: search → scrape → extract; skip aggregators│
+│ response_format = OrchestratorOutput (Pydantic)         │
+└────────────────────┬────────────────────────────────────┘
+                     ▼
+┌─────────────────────────────────────────────────────────┐
+│ LOCAL VALIDATOR (deterministic, rule-based)             │
+│ phone normalization • confidence score • flags          │
+└────────────────────┬────────────────────────────────────┘
+                     ▼
+                RetailerRecord  →  Excel
+```
 
-### Why two Azure OpenAI deployments?
+**Why an orchestrator?** Each retailer is messy in its own way (some need a search, some have an obvious domain, some have JS-heavy sites that scrape poorly). Letting gpt-4o decide which tool to call when, and how to recover, beats a hard-coded sequence on the long tail. Cost is ~3× the LLM tokens of a hard-coded pipeline but still cents per retailer.
 
-`BingGroundingTool` does **not support gpt-4o-mini**. Supported models include gpt-4o, gpt-4-turbo, and gpt-4. So:
+**Why a deterministic validator after the agent?** Confidence scores from LLMs aren't calibrated. Phone-number normalization, domain-name matching, and field-presence checks are pure functions of the data — better to compute them locally than to ask the agent for them.
 
-- `AZURE_OPENAI_DEPLOYMENT_AGENT` = **gpt-4o** — used by the Foundry agent for the grounding-search call.
-- `AZURE_OPENAI_DEPLOYMENT_EXTRACTION` = **gpt-4o-mini** — used for the cheap structured extraction.
+### Tool details
 
-Both deployments live in the same Azure OpenAI resource.
+| Tool | Source | Purpose |
+|---|---|---|
+| Web search (Foundry-hosted) | `FoundryChatClient.get_web_search_tool()` | Find candidate URL for the retailer |
+| `scrape_retailer_site(url)` | `@tool` in `src/tools.py` | Fetch `/`, `/about`, `/contact`, product pages; pull JSON-LD; cache for the next call |
+| `extract_retailer_fields(name, url)` | `@tool` in `src/tools.py` | Read scraped pages from cache; one gpt-4o-mini call to `chat.completions.parse` returns `ExtractedRetailer` |
+
+Token-efficiency trick: `scrape_retailer_site` returns only a 1-line summary to the orchestrator. The full scraped text never enters the orchestrator's context — it lives in a process-local dict that `extract_retailer_fields` reads on the next turn. Without this, scraped HTML would burn ~10× the orchestrator tokens.
+
+### Pre-agent heuristic
+
+Before invoking the agent, single-word alphanumeric retailer names (Sephora, Target, Walmart) are mapped to `https://www.<name>.com` and passed in the prompt as a `Likely website:` hint. The agent verifies via search before trusting it. This saves the agent a search call on roughly half of inputs.
 
 ## Setup
 
 ### 1. Provision Azure resources
 
-- **Azure AI Foundry project** — create in Foundry portal. Note the project endpoint.
-- **Azure OpenAI** — deploy `gpt-4o` and `gpt-4o-mini` in the same resource.
-- **Grounding with Bing Search** — create a "Grounding with Bing Search" resource in Azure portal. In your Foundry project, add a Connection to it. Note the connection ID (`/subscriptions/.../connections/<name>`).
+- **Azure AI Foundry project** — create in Foundry portal; note the project endpoint.
+- **Foundry Web Search connection** — add via Foundry portal → Project → Connected resources → Add → Web Search. `HostedWebSearchTool` uses this connection automatically.
+- **Azure OpenAI** — deploy `gpt-4o` (orchestrator) and `gpt-4o-mini` (extraction) in the same Azure OpenAI resource attached to the project.
 
 ### 2. Auth
 
-`DefaultAzureCredential` is used for the Foundry client. For local dev, run `az login` once. In production, use a managed identity.
-
-The Azure OpenAI extraction client uses an API key by default. To use AAD instead, leave `AZURE_OPENAI_API_KEY` blank — the code falls back to `DefaultAzureCredential` with a bearer token provider.
+`DefaultAzureCredential` is used for both the orchestrator (FoundryChatClient) and the extraction client (Azure OpenAI). For local dev: `az login` once. In production: managed identity. No API keys.
 
 ### 3. Install + configure
 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env       # fill in the values
-az login                   # if using AAD locally
+az login                   # local dev only
 ```
 
 ### 4. Run
@@ -64,15 +89,11 @@ python -m src.main --input retailers.xlsx --output enriched.xlsx
 
 | Item | Per retailer | 1,000 retailers |
 |---|---|---|
-| Grounding with Bing transaction | $0.014 | $14 |
-| Agent (gpt-4o) call | ~$0.005 | $5 |
-| Heuristic short-circuit (~50% hit rate) | -50% above | ~-$10 |
-| Extraction (gpt-4o-mini) | ~$0.001 | $1 |
-| **Total** | **~$0.012** | **~$11** |
-
-## Compliance note
-
-Microsoft documents that **data sent to Grounding with Bing Search leaves the Azure compliance boundary**: the grounding service is not subject to the same data-processing terms as the rest of Foundry. Names sent for lookup will go to Bing. If your retailer names are sensitive, raise this with your security team before running at scale.
+| Foundry Web Search call | ~$0.005 | ~$5 |
+| Orchestrator (gpt-4o, ~3 tool decisions) | ~$0.012 | ~$12 |
+| Extraction (gpt-4o-mini) | ~$0.001 | ~$1 |
+| Heuristic short-circuit on search (~50%) | -50% search only | -~$2.50 |
+| **Total** | **~$0.013** | **~$13** |
 
 ## Tests
 
@@ -80,14 +101,19 @@ Microsoft documents that **data sent to Grounding with Bing Search leaves the Az
 pytest tests/
 ```
 
-Tests mock the Foundry agent — no Azure credentials required to run them.
+Tests mock `Agent.run` so no Azure credentials are needed. Each test calls the real pipeline functions with a faked agent response.
 
-## Migration note (v1 → v2)
+## Code map
 
-The old standalone Bing Search v7 API was retired Aug 11, 2025. v2 of this pipeline removes:
-
-- `BING_SEARCH_KEY`, `BING_SEARCH_ENDPOINT`, `GOOGLE_API_KEY`, `GOOGLE_CSE_ID`, `SEARCH_PRIMARY` (env vars)
-- `kernel_setup.py`, `semantic-kernel` dependency
-- `BingSearch`, `GoogleCseSearch`, `SearchDispatcher` classes
-
-Replaced by a single `FoundryGroundingSearch` that owns one shared agent and uses the Responses API.
+| File | Purpose |
+|---|---|
+| `src/main.py` | CLI entry point |
+| `src/config.py` | Env-var loading |
+| `src/agent.py` | `build_orchestrator(settings)` — wires FoundryChatClient + 3 tools |
+| `src/tools.py` | Two `@tool`-decorated functions and their lazy-init clients |
+| `src/pipeline.py` | `process_retailer` (heuristic + agent.run + post-filter + validate) and `run_pipeline` (concurrency wrapper) |
+| `src/models.py` | Pydantic schemas (`OrchestratorOutput`, `ExtractedRetailer`, `RetailerRecord`, `PriceSample`) |
+| `src/plugins/scraper.py` | HTTP fetch + JSON-LD parse — wrapped by `scrape_retailer_site` |
+| `src/plugins/extractor.py` | gpt-4o-mini structured-output extraction — wrapped by `extract_retailer_fields` |
+| `src/plugins/validator.py` | Phone normalization, confidence scoring, flags |
+| `src/excel_io.py` | Excel read/write |

@@ -5,82 +5,113 @@ import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import AsyncIterator
+from urllib.parse import urlparse
 
-from openai import AsyncAzureOpenAI
+from agent_framework import Agent, ChatOptions
+from agent_framework.foundry import FoundryChatClient
 
+from . import tools as tools_mod
+from .agent import build_orchestrator
 from .config import Settings
-from .models import ExtractedRetailer, RetailerRecord
-from .plugins.extractor import extract_retailer
-from .plugins.scraper import Scraper
-from .plugins.search import FoundryGroundingSearch
+from .models import ExtractedRetailer, OrchestratorOutput, RetailerRecord
 from .plugins.validator import score_record
 
 log = logging.getLogger(__name__)
+
+AGGREGATOR_HOSTS = (
+    "yelp.", "yellowpages.", "wikipedia.", "facebook.", "linkedin.",
+    "instagram.", "twitter.", "x.com", "amazon.", "ebay.", "bbb.",
+    "tripadvisor.", "pinterest.", "etsy.",
+)
 
 
 @dataclass
 class PipelineDeps:
     settings: Settings
-    search: FoundryGroundingSearch
-    scraper: Scraper
-    openai_client: AsyncAzureOpenAI
+    agent: Agent
+    client: FoundryChatClient
 
 
 @asynccontextmanager
 async def build_deps(settings: Settings) -> AsyncIterator[PipelineDeps]:
-    """Sets up the Foundry agent + clients, yields deps, tears down on exit."""
-    if settings.azure_openai_api_key:
-        openai_client = AsyncAzureOpenAI(
-            api_key=settings.azure_openai_api_key,
-            api_version=settings.azure_openai_api_version,
-            azure_endpoint=settings.azure_openai_endpoint,
-        )
-    else:
-        # AAD auth path: token comes from DefaultAzureCredential.
-        from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
-        token_provider = get_bearer_token_provider(
-            DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
-        )
-        openai_client = AsyncAzureOpenAI(
-            azure_ad_token_provider=token_provider,
-            api_version=settings.azure_openai_api_version,
-            azure_endpoint=settings.azure_openai_endpoint,
-        )
-
-    async with FoundryGroundingSearch(settings) as search:
+    agent, client = build_orchestrator(settings)
+    try:
+        yield PipelineDeps(settings=settings, agent=agent, client=client)
+    finally:
         try:
-            yield PipelineDeps(
-                settings=settings,
-                search=search,
-                scraper=Scraper(settings),
-                openai_client=openai_client,
-            )
-        finally:
-            await openai_client.close()
+            await client.close()
+        except Exception as e:
+            log.warning("FoundryChatClient close failed: %s", e)
+        await tools_mod.aclose()
+
+
+def _heuristic_domain(name: str) -> str | None:
+    """Single-word alphanumeric retailer names map cleanly to <name>.com."""
+    cleaned = name.strip().lower()
+    if 3 <= len(cleaned) <= 25 and cleaned.isalnum():
+        return f"https://www.{cleaned}.com"
+    return None
+
+
+def _is_aggregator(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(bad in host for bad in AGGREGATOR_HOSTS)
+
+
+def _coerce_output(result: object) -> OrchestratorOutput | None:
+    """ChatAgent.run with response_format returns an AgentRunResponse whose
+    parsed payload may live on `.value`, `.parsed`, or be reconstructable from
+    `.text`. Try each."""
+    for attr in ("value", "parsed", "output_parsed"):
+        v = getattr(result, attr, None)
+        if isinstance(v, OrchestratorOutput):
+            return v
+    text = getattr(result, "text", None)
+    if isinstance(text, str) and text.strip():
+        try:
+            return OrchestratorOutput.model_validate_json(text)
+        except Exception:
+            pass
+    return None
 
 
 async def process_retailer(name: str, deps: PipelineDeps) -> RetailerRecord:
-    website = await deps.search.find_official_site(name)
-    if not website:
-        return score_record(name, None, ExtractedRetailer(), [])
+    hint = _heuristic_domain(name)
+    user_msg = f"Retailer: {name}"
+    if hint:
+        user_msg += f"\nLikely website: {hint} (verify before trusting)"
 
     try:
-        pages = await deps.scraper.fetch_site(website)
+        result = await deps.agent.run(
+            user_msg,
+            options=ChatOptions(response_format=OrchestratorOutput),
+        )
     except Exception as e:
-        log.error("Scrape failed for %s (%s): %s", name, website, e)
-        pages = []
+        log.exception("Orchestrator failed for %s: %s", name, e)
+        return score_record(name, None, ExtractedRetailer(), [])
+    finally:
+        tools_mod.reset_scrape_cache()
 
-    page_tuples = [(p.url, p.text) for p in pages]
-    json_ld_blobs = [b for p in pages for b in p.json_ld]
-    extracted = await extract_retailer(
-        deps.openai_client,
-        deps.settings.extraction_deployment,
-        name,
-        page_tuples,
-        json_ld_blobs,
+    output = _coerce_output(result)
+    if output is None:
+        log.warning("Orchestrator returned unparseable output for %s", name)
+        return score_record(name, None, ExtractedRetailer(), [])
+
+    website = output.website
+    if website and _is_aggregator(website):
+        log.warning("Orchestrator returned aggregator URL for %s: %s", name, website)
+        website = None
+
+    extracted = ExtractedRetailer(
+        about=output.about,
+        categories=output.categories,
+        brands=output.brands,
+        sample_prices=output.sample_prices,
+        phone=output.phone,
+        email=output.email,
+        address=output.address,
     )
-    sources = [p.url for p in pages]
-    return score_record(name, website, extracted, sources)
+    return score_record(name, website, extracted, output.sources)
 
 
 async def run_pipeline(
